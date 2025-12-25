@@ -1,9 +1,9 @@
 name: CI-CD
 
 on:
-  pull_request:
-    branches: [ "main" ]
   push:
+    branches: [ "main" ]
+  pull_request:
     branches: [ "main" ]
   workflow_dispatch:
     inputs:
@@ -52,13 +52,130 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (github.event.inputs.deploy || 'true') == 'true')
 
     steps:
+      - name: Validate secrets exist (quick)
+        shell: bash
+        run: |
+          set -e
+          [ -n "${{ secrets.SSH_HOST }}" ] || (echo "Missing secret: SSH_HOST" && exit 1)
+          [ -n "${{ secrets.SSH_PORT }}" ] || (echo "Missing secret: SSH_PORT" && exit 1)
+          [ -n "${{ secrets.SSH_USER }}" ] || (echo "Missing secret: SSH_USER" && exit 1)
+          [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ] || (echo "Missing secret: SSH_PRIVATE_KEY" && exit 1)
+          echo "Secrets present"
+
+      - name: Debug - runner network info (public IP)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner date:"
+          date
+          echo "Runner outbound public IPs (may differ):"
+          curl -sS https://api.ipify.org || true
+          echo
+          curl -sS https://ifconfig.me || true
+          echo
+          echo "Host/Port:"
+          echo "SSH_HOST=${{ secrets.SSH_HOST }}"
+          echo "SSH_PORT=${{ secrets.SSH_PORT }}"
+          echo "SSH_USER=${{ secrets.SSH_USER }}"
+
+      - name: Debug - DNS/resolve (even if host is IP)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "getent hosts:"
+          getent hosts "${{ secrets.SSH_HOST }}" || true
+          echo "nslookup:"
+          nslookup "${{ secrets.SSH_HOST }}" || true
+
+      - name: Debug - TCP reachability to SSH port (critical)
+        id: tcp
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="${{ secrets.SSH_HOST }}"
+          PORT="${{ secrets.SSH_PORT }}"
+
+          echo "Checking TCP to ${HOST}:${PORT}"
+          # nc는 timeout 시 exit!=0
+          if timeout 6 bash -lc "nc -vz -w 5 ${HOST} ${PORT}"; then
+            echo "nc: TCP OK"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "nc: TCP FAIL"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Also /dev/tcp check"
+          if timeout 6 bash -lc "cat < /dev/null > /dev/tcp/${HOST}/${PORT}"; then
+            echo "/dev/tcp: TCP OK"
+            echo "ok2=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "/dev/tcp: TCP FAIL"
+            echo "ok2=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Debug - build ssh key files (do not fail on keyscan)
+        if: steps.tcp.outputs.ok == 'true' || steps.tcp.outputs.ok2 == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # private key (OpenSSH format 그대로 저장)
+          cat > ~/.ssh/deploy_key <<'KEY'
+          ${{ secrets.SSH_PRIVATE_KEY }}
+          KEY
+          chmod 600 ~/.ssh/deploy_key
+
+          echo "Private key fingerprint (local):"
+          ssh-keygen -lf ~/.ssh/deploy_key || true
+
+          # known_hosts: secret 있으면 그걸 쓰고, 없으면 keyscan 시도(실패해도 진행)
+          if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
+            echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            # keyscan은 네트워크 조금만 불안해도 exit 1 낼 수 있어서 || true 붙임
+            ssh-keyscan -p "${{ secrets.SSH_PORT }}" -T 5 "${{ secrets.SSH_HOST }}" > ~/.ssh/known_hosts || true
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          echo "known_hosts lines:"
+          wc -l ~/.ssh/known_hosts || true
+          echo "known_hosts preview:"
+          head -n 3 ~/.ssh/known_hosts || true
+
+      - name: Debug - SSH handshake (verbose)
+        if: steps.tcp.outputs.ok == 'true' || steps.tcp.outputs.ok2 == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="${{ secrets.SSH_HOST }}"
+          PORT="${{ secrets.SSH_PORT }}"
+          USER="${{ secrets.SSH_USER }}"
+
+          echo "Trying SSH with -vvv (this is the most useful log)"
+          # StrictHostKeyChecking은 known_hosts가 비어있으면 실패할 수 있음(그게 또 힌트)
+          ssh -vvv \
+            -i ~/.ssh/deploy_key \
+            -p "${PORT}" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=5 \
+            -o ServerAliveCountMax=1 \
+            -o StrictHostKeyChecking=accept-new \
+            "${USER}@${HOST}" 'echo "SSH_OK"; uname -a; whoami' || true
+
       - name: Download artifact (jar)
+        if: steps.tcp.outputs.ok == 'true' || steps.tcp.outputs.ok2 == 'true'
         uses: actions/download-artifact@v4
         with:
           name: app-jar
           path: dist
 
       - name: Pick jar as app.jar
+        if: steps.tcp.outputs.ok == 'true' || steps.tcp.outputs.ok2 == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -68,64 +185,9 @@ jobs:
           cp "${JAR_PATH}" dist/app.jar
           ls -al dist
 
-      - name: Install openssh-client + netcat (for debug)
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y openssh-client netcat-openbsd
-
-      - name: Debug - show secrets presence (no values)
-        shell: bash
-        run: |
-          set -euo pipefail
-          [ -n "${{ secrets.SSH_HOST }}" ] && echo "SSH_HOST set" || (echo "SSH_HOST missing"; exit 1)
-          [ -n "${{ secrets.SSH_PORT }}" ] && echo "SSH_PORT set" || (echo "SSH_PORT missing"; exit 1)
-          [ -n "${{ secrets.SSH_USER }}" ] && echo "SSH_USER set" || (echo "SSH_USER missing"; exit 1)
-          [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ] && echo "SSH_PRIVATE_KEY set" || (echo "SSH_PRIVATE_KEY missing"; exit 1)
-
-      - name: Prepare SSH files (key/known_hosts)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          # private key (절대 echo로 여러줄 깨지게 하지 말고 printf로 쓴다)
-          printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-
-          HOST="${{ secrets.SSH_HOST }}"
-          PORT="${{ secrets.SSH_PORT }}"
-
-          # known_hosts
-          if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
-            printf "%s\n" "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          else
-            # keyscan이 실패할 수 있으니 로그 남기고, 실패하면 여기서 중단시키고 싶으면 || true 제거하면 된다
-            ssh-keyscan -p "${PORT}" -T 5 "${HOST}" > ~/.ssh/known_hosts || true
-          fi
-          chmod 600 ~/.ssh/known_hosts
-
-          echo "known_hosts lines:"
-          wc -l ~/.ssh/known_hosts || true
-          echo "known_hosts preview:"
-          head -n 3 ~/.ssh/known_hosts || true
-
-      - name: Debug - DNS + TCP connectivity
-        shell: bash
-        run: |
-          set -euo pipefail
-          HOST="${{ secrets.SSH_HOST }}"
-          PORT="${{ secrets.SSH_PORT }}"
-
-          echo "Resolving host..."
-          getent ahosts "${HOST}" || true
-
-          echo "Checking TCP to ${HOST}:${PORT}"
-          nc -vz -w 5 "${HOST}" "${PORT}"
-
-      - name: Debug - SSH handshake (no command)
+      # appleboy 대신 표준 scp/ssh로 가면 디버깅이 훨씬 쉬움
+      - name: SCP app.jar to server (key-only)
+        if: steps.tcp.outputs.ok == 'true' || steps.tcp.outputs.ok2 == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -133,41 +195,32 @@ jobs:
           PORT="${{ secrets.SSH_PORT }}"
           USER="${{ secrets.SSH_USER }}"
 
-          # StrictHostKeyChecking=yes를 유지하려면 known_hosts가 정상이어야 한다.
-          ssh -i ~/.ssh/deploy_key -p "${PORT}" \
-            -o BatchMode=yes \
-            -o ConnectTimeout=7 \
-            -o StrictHostKeyChecking=accept-new \
-            "${USER}@${HOST}" "echo SSH_OK && whoami && hostname"
-
-      - name: SCP jar to server incoming/app.jar (openssh scp)
-        shell: bash
-        run: |
-          set -euo pipefail
-          HOST="${{ secrets.SSH_HOST }}"
-          PORT="${{ secrets.SSH_PORT }}"
-          USER="${{ secrets.SSH_USER }}"
-
-          scp -i ~/.ssh/deploy_key -P "${PORT}" \
+          scp -v -P "${PORT}" \
+            -i ~/.ssh/deploy_key \
             -o BatchMode=yes \
             -o ConnectTimeout=10 \
             -o StrictHostKeyChecking=accept-new \
-            dist/app.jar "${USER}@${HOST}:/opt/githubactionPractice/incoming/app.jar"
+            dist/app.jar \
+            "${USER}@${HOST}:/opt/githubactionPractice/incoming/app.jar"
 
-      - name: Deploy on server (run deploy script)
+      - name: Deploy on server (key-only)
+        if: steps.tcp.outputs.ok == 'true' || steps.tcp.outputs.ok2 == 'true'
         shell: bash
         run: |
           set -euo pipefail
           HOST="${{ secrets.SSH_HOST }}"
           PORT="${{ secrets.SSH_PORT }}"
           USER="${{ secrets.SSH_USER }}"
+
           SIM_FAIL="${{ github.event.inputs.simulate_cd_fail || 'false' }}"
 
-          ssh -i ~/.ssh/deploy_key -p "${PORT}" \
+          ssh -v -p "${PORT}" \
+            -i ~/.ssh/deploy_key \
             -o BatchMode=yes \
             -o ConnectTimeout=10 \
             -o StrictHostKeyChecking=accept-new \
-            "${USER}@${HOST}" bash -lc "set -euo pipefail
+            "${USER}@${HOST}" "
+              set -euo pipefail
               echo 'incoming listing:'
               ls -al /opt/githubactionPractice/incoming
 
@@ -176,8 +229,17 @@ jobs:
                 exit 1
               fi
 
-              /usr/local/bin/deploy_githubactionPractice.sh
+              # 권한/실행 문제 대비: bash로 직접 실행도 가능
+              sudo /usr/local/bin/deploy_githubactionPractice.sh
 
               echo 'service status:'
-              sudo systemctl status githubactionPractice --no-pager -l
+              sudo systemctl status githubactionPractice --no-pager -l || true
             "
+
+      - name: If TCP failed, explain next step
+        if: steps.tcp.outputs.ok != 'true' && steps.tcp.outputs.ok2 != 'true'
+        shell: bash
+        run: |
+          echo "TCP to SSH port is NOT reachable from GitHub-hosted runner."
+          echo "This is not an SSH key problem. It's network/firewall/ISP/geo-block/NAT allowlist."
+          exit 1

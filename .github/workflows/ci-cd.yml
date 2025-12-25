@@ -16,6 +16,10 @@ on:
         required: false
         default: "false"
 
+concurrency:
+  group: githubactionPractice-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -50,7 +54,68 @@ jobs:
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (github.event.inputs.deploy || 'true') == 'true')
+
     steps:
+      - name: Show target info (masked)
+        run: |
+          echo "SSH_HOST is set? -> $([[ -n '${{ secrets.SSH_HOST }}' ]] && echo YES || echo NO)"
+          echo "SSH_PORT=${{ secrets.SSH_PORT }}"
+          echo "SSH_USER=${{ secrets.SSH_USER }}"
+          echo "PRIVATE_KEY length=${#SSH_PRIVATE_KEY}"
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Install tools (ssh, scp, nc, dig)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-client netcat-openbsd dnsutils
+
+      - name: DNS / IP check
+        run: |
+          echo "dig +short ${{ secrets.SSH_HOST }} || true"
+          dig +short "${{ secrets.SSH_HOST }}" || true
+
+      - name: TCP connectivity check (most important)
+        run: |
+          echo "Checking TCP to ${{ secrets.SSH_HOST }}:${{ secrets.SSH_PORT }}"
+          nc -vz -w 5 "${{ secrets.SSH_HOST }}" "${{ secrets.SSH_PORT }}" || true
+
+          echo "Also /dev/tcp check"
+          timeout 5 bash -lc "cat < /dev/null > /dev/tcp/${{ secrets.SSH_HOST }}/${{ secrets.SSH_PORT }}" \
+            && echo "TCP OK" || echo "TCP FAIL"
+
+      - name: Prepare SSH key + known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          # private key
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          # known_hosts: secret 있으면 그걸 쓰고, 없으면 keyscan으로 만든다
+          if [ -n "${{ secrets.SSH_KNOWN_HOSTS }}" ]; then
+            echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "${{ secrets.SSH_PORT }}" -T 5 "${{ secrets.SSH_HOST }}" > ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+          echo "known_hosts line count:"
+          wc -l ~/.ssh/known_hosts || true
+
+      - name: SSH handshake debug (vvv)
+        run: |
+          set -x
+          ssh -vvv -i ~/.ssh/deploy_key \
+            -p "${{ secrets.SSH_PORT }}" \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=5 \
+            -o ServerAliveInterval=5 \
+            -o ServerAliveCountMax=2 \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "echo 'SSH OK'; whoami; hostname; pwd" || true
+
       - name: Download artifact (jar)
         uses: actions/download-artifact@v4
         with:
@@ -63,44 +128,35 @@ jobs:
           JAR_PATH="$(ls -1 dist/*.jar | head -n 1)"
           echo "Picked: ${JAR_PATH}"
           cp "${JAR_PATH}" dist/app.jar
-          ls -al dist
+          ls -al dist/app.jar
 
-      - name: Add known_hosts
+      - name: SCP jar to server (/opt/githubactionPractice/incoming/app.jar) with verbose
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
+          set -x
+          scp -vvv -i ~/.ssh/deploy_key \
+            -P "${{ secrets.SSH_PORT }}" \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            dist/app.jar \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/githubactionPractice/incoming/app.jar"
 
-      - name: SCP jar to server incoming/app.jar
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "dist/app.jar"
-          target: "/opt/githubactionPractice/incoming"
-          strip_components: 1
+      - name: Remote deploy (debug + optional failure)
+        run: |
+          set -euo pipefail
 
-      - name: Deploy on server (move -> releases, switch current, restart)
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            echo "incoming listing:"
-            ls -al /opt/githubactionPractice/incoming
+          if [ "${{ github.event.inputs.simulate_cd_fail || 'false' }}" = "true" ]; then
+            echo "simulate_cd_fail=true -> forcing failure"
+            exit 1
+          fi
 
-            if [ "${{ github.event.inputs.simulate_cd_fail || 'false' }}" = "true" ]; then
-              echo "simulate_cd_fail=true -> forcing failure"
-              exit 1
-            fi
-
-            /usr/local/bin/deploy_githubactionPractice.sh
-
-            echo "service status:"
-            sudo systemctl status githubactionPractice --no-pager -l
+          ssh -vvv -i ~/.ssh/deploy_key \
+            -p "${{ secrets.SSH_PORT }}" \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "set -euo pipefail
+             echo 'incoming listing:'; ls -al /opt/githubactionPractice/incoming
+             echo 'deploy script perms:'; ls -l /usr/local/bin/deploy_githubactionPractice.sh || true
+             echo 'run deploy:'; /usr/local/bin/deploy_githubactionPractice.sh
+             echo 'service status:'; sudo systemctl status githubactionPractice --no-pager -l || true
+             echo 'last logs:'; sudo journalctl -u githubactionPractice -n 80 --no-pager || true"

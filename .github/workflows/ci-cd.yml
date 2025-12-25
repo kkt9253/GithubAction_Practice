@@ -1,0 +1,100 @@
+name: CI-CD
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      simulate_cd_fail:
+        description: "CD 단계에서 강제 실패 재연(true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle permission
+        run: chmod +x ./gradlew
+
+      - name: Test
+        run: ./gradlew test
+
+      - name: Build bootJar
+        run: ./gradlew clean bootJar -x test
+
+      - name: Upload artifact (jar)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: build/libs/*.jar
+
+  cd:
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Download artifact (jar)
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: dist
+
+      - name: Pick jar as app.jar
+        run: |
+          ls -al dist
+          JAR_PATH="$(ls -1 dist/*.jar | head -n 1)"
+          echo "Picked: ${JAR_PATH}"
+          cp "${JAR_PATH}" dist/app.jar
+          ls -al dist
+
+      - name: Add known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: SCP jar to server incoming/app.jar
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "dist/app.jar"
+          target: "/opt/githubactionPractice/incoming"
+          strip_components: 1
+
+      - name: Deploy on server (move -> releases, switch current, restart)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          port: ${{ secrets.SSH_PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            echo "incoming listing:"
+            ls -al /opt/githubactionPractice/incoming
+
+            if [ "${{ github.event.inputs.simulate_cd_fail || 'false' }}" = "true" ]; then
+              echo "simulate_cd_fail=true -> forcing failure"
+              exit 1
+            fi
+
+            /usr/local/bin/deploy_githubactionPractice.sh
+
+            echo "service status:"
+            sudo systemctl status githubactionPractice --no-pager -l

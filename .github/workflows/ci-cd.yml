@@ -34,7 +34,7 @@ jobs:
 
   cd:
     needs: ci
-    runs-on: [self-hosted, raspberrypi, prod]
+    runs-on: self-hosted
 
     steps:
       - name: Download artifact

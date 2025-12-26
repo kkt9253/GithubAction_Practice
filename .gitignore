@@ -27,7 +27,7 @@ out/
 !**/src/test/**/out/
 *.yml
 *.yaml
-application.properties
+#application.properties
 .env
 
 ### NetBeans ###

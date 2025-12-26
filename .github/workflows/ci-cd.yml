@@ -1,27 +1,15 @@
 name: CI-CD
 
 on:
-  pull_request:
-    branches: [ "main" ]
   push:
     branches: [ "main" ]
   workflow_dispatch:
-    inputs:
-      deploy:
-        description: "수동 실행 시 CD까지 진행(true/false)"
-        required: false
-        default: "true"
-      simulate_cd_fail:
-        description: "CD 단계에서 강제 실패 재연(true/false)"
-        required: false
-        default: "false"
 
 jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -29,16 +17,16 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Gradle permission
+      - name: Grant gradle permission
         run: chmod +x ./gradlew
 
       - name: Test
         run: ./gradlew test
 
-      - name: Build bootJar
+      - name: Build
         run: ./gradlew clean bootJar -x test
 
-      - name: Upload artifact (jar)
+      - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
           name: app-jar
@@ -46,64 +34,32 @@ jobs:
 
   cd:
     needs: ci
-
-    # ✅ 여기부터가 핵심: self-hosted 러너에서 실행
-    # 라벨 안쓸거면 [self-hosted]만 둬도 됨
-    runs-on: self-hosted
-    #runs-on: [self-hosted, raspberrypi, prod]
-
-    if: |
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
-      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (github.event.inputs.deploy || 'true') == 'true')
+    runs-on: [self-hosted, raspberrypi, prod]
 
     steps:
-      - name: Download artifact (jar)
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: app-jar
           path: dist
 
-      - name: Pick jar as app.jar
-        shell: bash
+      - name: Prepare app.jar
         run: |
-          set -euo pipefail
-          ls -al dist
-          JAR_PATH="$(ls -1 dist/*.jar | head -n 1)"
-          echo "Picked: ${JAR_PATH}"
-          cp "${JAR_PATH}" dist/app.jar
+          set -e
+          JAR=$(ls dist/*.jar | head -n 1)
+          cp "$JAR" dist/app.jar
           ls -al dist
 
-      - name: Preflight (paths, permissions, sudo)
-        shell: bash
+      - name: Copy jar to incoming (local)
         run: |
-          set -euo pipefail
-          whoami
-          id
-          ls -ld /opt/githubactionPractice /opt/githubactionPractice/incoming
-          test -w /opt/githubactionPractice/incoming
-          sudo -n true
-          ls -l /usr/local/bin/deploy_githubactionPractice.sh
-          systemctl cat githubactionPractice || true
-
-      - name: Copy jar to incoming
-        shell: bash
-        run: |
-          set -euo pipefail
-          install -m 0644 dist/app.jar /opt/githubactionPractice/incoming/app.jar
+          set -e
+          sudo mkdir -p /opt/githubactionPractice/incoming
+          sudo cp -f dist/app.jar /opt/githubactionPractice/incoming/app.jar
+          sudo chown kkt:kkt /opt/githubactionPractice/incoming/app.jar
           ls -al /opt/githubactionPractice/incoming
 
-      - name: Deploy (simulate fail option supported)
-        shell: bash
+      - name: Deploy
         run: |
-          set -euo pipefail
-          SIM="${{ github.event.inputs.simulate_cd_fail || 'false' }}"
-          echo "simulate_cd_fail=${SIM}"
-          if [ "${SIM}" = "true" ]; then
-            echo "forcing failure..."
-            exit 1
-          fi
-
-          /usr/local/bin/deploy_githubactionPractice.sh
-
-          echo "service status:"
-          sudo systemctl status githubactionPractice --no-pager -l || true
+          set -e
+          sudo /usr/local/bin/deploy_githubactionPractice.sh
+          sudo systemctl status githubactionPractice --no-pager -l

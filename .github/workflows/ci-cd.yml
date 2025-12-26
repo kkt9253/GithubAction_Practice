@@ -1,9 +1,9 @@
 name: CI-CD
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
+    branches: [ "main" ]
+  push:
     branches: [ "main" ]
   workflow_dispatch:
     inputs:
@@ -46,75 +46,16 @@ jobs:
 
   cd:
     needs: ci
-    runs-on: ubuntu-latest
+
+    # ✅ 여기부터가 핵심: self-hosted 러너에서 실행
+    # 라벨 안쓸거면 [self-hosted]만 둬도 됨
+    runs-on: [self-hosted, raspberrypi, prod]
+
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (github.event.inputs.deploy || 'true') == 'true')
+
     steps:
-      - name: Debug - show runner egress IP & DNS
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Runner public IP (egress):"
-          curl -4 -s https://api.ipify.org || true
-          echo
-          echo "Resolve host:"
-          getent ahosts "${{ secrets.SSH_HOST }}" || true
-
-      - name: Debug - TCP reachability to SSH port (critical)
-        shell: bash
-        run: |
-          set -euo pipefail
-          HOST="${{ secrets.SSH_HOST }}"
-          PORT="${{ secrets.SSH_PORT }}"
-          echo "Checking TCP to ${HOST}:${PORT}"
-          # nc 방식
-          if nc -vz -w 5 "${HOST}" "${PORT}"; then
-            echo "nc: TCP OK"
-          else
-            echo "nc: TCP FAIL"
-            echo "Also /dev/tcp check"
-            timeout 5 bash -lc "cat < /dev/null > /dev/tcp/${HOST}/${PORT}" && echo "/dev/tcp: TCP OK" || echo "/dev/tcp: TCP FAIL"
-            echo "TCP to SSH port is NOT reachable from GitHub-hosted runner."
-            echo "=> Not an SSH key problem. It's network/firewall/ISP/geo-block/NAT allowlist."
-            exit 1
-          fi
-
-      - name: Debug - build ssh key files (do not fail on keyscan)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          # private key from secret (key-only)
-          printf "%s\n" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-
-          # known_hosts: secret 있으면 사용, 없으면 keyscan(실패해도 계속)
-          if [ -n "${{ secrets.SSH_KNOWN_HOSTS || '' }}" ]; then
-            printf "%s\n" "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          else
-            ssh-keyscan -p "${{ secrets.SSH_PORT }}" -T 5 "${{ secrets.SSH_HOST }}" > ~/.ssh/known_hosts 2>/dev/null || true
-          fi
-          chmod 600 ~/.ssh/known_hosts || true
-
-          echo "known_hosts lines:"
-          wc -l ~/.ssh/known_hosts || true
-
-      - name: Debug - SSH handshake (verbose)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ssh -vvv \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile=~/.ssh/known_hosts \
-            -i ~/.ssh/deploy_key \
-            -p "${{ secrets.SSH_PORT }}" \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
-            "echo 'SSH OK'; whoami; hostname; date" || true
-
       - name: Download artifact (jar)
         uses: actions/download-artifact@v4
         with:
@@ -131,35 +72,37 @@ jobs:
           cp "${JAR_PATH}" dist/app.jar
           ls -al dist
 
-      - name: SCP app.jar to server (key-only)
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "dist/app.jar"
-          target: "/opt/githubactionPractice/incoming"
-          strip_components: 1
+      - name: Preflight (paths, permissions, sudo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          whoami
+          id
+          ls -ld /opt/githubactionPractice /opt/githubactionPractice/incoming
+          test -w /opt/githubactionPractice/incoming
+          sudo -n true
+          ls -l /usr/local/bin/deploy_githubactionPractice.sh
+          systemctl cat githubactionPractice || true
 
-      - name: Deploy on server (key-only)
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          port: ${{ secrets.SSH_PORT }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            set -euo pipefail
-            echo "incoming listing:"
-            ls -al /opt/githubactionPractice/incoming
+      - name: Copy jar to incoming
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 dist/app.jar /opt/githubactionPractice/incoming/app.jar
+          ls -al /opt/githubactionPractice/incoming
 
-            if [ "${{ github.event.inputs.simulate_cd_fail || 'false' }}" = "true" ]; then
-              echo "simulate_cd_fail=true -> forcing failure"
-              exit 1
-            fi
+      - name: Deploy (simulate fail option supported)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIM="${{ github.event.inputs.simulate_cd_fail || 'false' }}"
+          echo "simulate_cd_fail=${SIM}"
+          if [ "${SIM}" = "true" ]; then
+            echo "forcing failure..."
+            exit 1
+          fi
 
-            /usr/local/bin/deploy_githubactionPractice.sh
+          /usr/local/bin/deploy_githubactionPractice.sh
 
-            echo "service status:"
-            sudo systemctl status githubactionPractice --no-pager -l
+          echo "service status:"
+          sudo systemctl status githubactionPractice --no-pager -l || true

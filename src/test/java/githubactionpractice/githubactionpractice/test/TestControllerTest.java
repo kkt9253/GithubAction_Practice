@@ -9,7 +9,7 @@ class TestControllerTest {
     @Test
     void health_returns_OK() {
         TestController c = new TestController();
-        assertThat(c.testMethod()).isEqualTo("Hi! This is GithubAction test api request! success!!");
+        assertThat(c.testMethod()).isEqualTo("TEST1! Hi! This is GithubAction test api request! success!!");
     }
 
 //    @Test

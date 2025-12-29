@@ -8,7 +8,7 @@ public class TestController {
 
     @GetMapping("/test")
     public String testMethod() {
-        return "Hi! This is GithubAction test api request! success!!";
+        return "TEST1! Hi! This is GithubAction test api request! success!!";
     }
 
 }

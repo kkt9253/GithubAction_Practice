@@ -37,6 +37,17 @@ jobs:
     runs-on: self-hosted
 
     steps:
+      - name: Clean dist dir (self-hosted residue)
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          rm -rf dist
+          mkdir -p dist
+          
+          echo "[clean] dist listing:"
+          ls -al dist
+
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -45,9 +56,25 @@ jobs:
 
       - name: Prepare app.jar
         run: |
-          set -e
-          JAR=$(ls dist/*.jar | head -n 1)
-          cp "$JAR" dist/app.jar
+          set -euo pipefail
+  
+          echo "[prepare] dist listing(before):"
+          ls -al dist || true
+          
+          rm -f dist/app.jar
+          
+          JAR="$(ls -1 dist/*.jar | grep -vE '/app\.jar$' | head -n 1)"
+          
+          if [ -z "${JAR:-}" ]; then
+            echo "ERROR: no jar found in dist/"
+            ls -al dist
+            exit 1
+          fi
+        
+          echo "Picked jar: $JAR"
+          cp -f "$JAR" dist/app.jar
+          
+          echo "[prepare] dist listing(after):"
           ls -al dist
 
       - name: Copy jar to incoming (local)

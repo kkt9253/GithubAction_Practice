@@ -10,5 +10,4 @@ public class TestController {
     public String testMethod() {
         return "TEST1! Hi! This is GithubAction test api request! success!!";
     }
-
 }

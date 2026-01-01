@@ -17,8 +17,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        # (도커 빌드만 할 거면 JDK 단계는 생략 가능.
-        #  하지만 테스트/빌드 산출물을 확인하고 싶으면 유지)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -33,6 +31,8 @@ jobs:
       - name: Build jar
         run: ./gradlew clean bootJar -x test
 
+      # Dockerfile에서 COPY app.jar app.jar 를 쓰고 있으니,
+      # Docker 빌드 컨텍스트(레포 루트)에 app.jar를 만들어 둔다.
       - name: Prepare jar for Docker context
         shell: bash
         run: |
@@ -41,24 +41,34 @@ jobs:
           cp -f "$JAR" app.jar
           ls -al app.jar
 
+      # 멀티아키 빌드를 위한 QEMU (arm64 에뮬레이션)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # buildx 빌더 준비
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Docker login (Docker Hub)
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & Push image
-        shell: bash
-        run: |
-          set -euo pipefail
+      # 멀티아키(amd64 + arm64)로 빌드해서 Docker Hub에 push
+      - name: Build & Push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
 
-          IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/githubactionpractice"
-          SHA_TAG="${GITHUB_SHA::7}"
+          # 라즈베리파이가 arm64이므로 반드시 포함되어야 함
+          platforms: linux/amd64,linux/arm64
 
-          # Dockerfile이 레포 루트에 있다고 가정
-          docker build -t "${IMAGE}:${SHA_TAG}" -t "${IMAGE}:latest" .
-          docker push "${IMAGE}:${SHA_TAG}"
-          docker push "${IMAGE}:latest"
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/githubactionpractice:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/githubactionpractice:latest
 
   cd:
     needs: ci
@@ -69,5 +79,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 서버 로컬 스크립트 실행
+          # (선택) 이번 빌드 SHA를 서버에서도 쓰고 싶으면 ENV로 넘겨서 deploy-bg.sh가 pull에 활용하게 만들 수 있음
+          # export IMAGE_TAG="${{ github.sha }}"
+
           sudo /opt/githubactionPractice/scripts/deploy-bg.sh
